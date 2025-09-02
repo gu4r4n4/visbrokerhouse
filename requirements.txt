@@ -3,3 +3,4 @@ uvicorn
 pydantic
 asgiref
 python-multipart
+gunicorn>=21.2
