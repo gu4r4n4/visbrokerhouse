@@ -75,7 +75,8 @@ async def ingest(file: UploadFile = File(...), company_hint: Optional[str] = For
 
 from fastapi.responses import RedirectResponse
 
-@app.get("/")
+@app.get("/", include_in_schema=False)
 def root():
     return RedirectResponse(url="/docs")
+
 
