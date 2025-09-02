@@ -1,6 +1,6 @@
 import traceback
 import tempfile
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
@@ -80,3 +80,32 @@ def root():
     return RedirectResponse(url="/docs")
 
 
+
+@app.get("/db/ping")
+def db_ping():
+    """
+    Connectivity check to Supabase Postgres.
+    Returns server version and whether the 'offers' table exists.
+    """
+    import psycopg  # local import
+    uri = os.getenv("DB_URI")
+    if not uri:
+        raise HTTPException(status_code=500, detail="DB_URI not set")
+
+    try:
+        with psycopg.connect(uri, connect_timeout=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute("select version()")
+                version = cur.fetchone()[0]
+                cur.execute("""
+                    select exists (
+                        select 1
+                        from information_schema.tables
+                        where table_schema = 'public'
+                          and table_name   = 'offers'
+                    )
+                """)
+                has_offers = cur.fetchone()[0]
+        return {"ok": True, "version": version, "offers_table": has_offers}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
