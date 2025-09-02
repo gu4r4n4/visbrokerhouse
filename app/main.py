@@ -10,9 +10,19 @@ from pydantic import BaseModel, Field
 from app.parsers.router import parse_document
 from app.ai.extract import ai_enrich_and_validate
 
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Insurance Offer Extractor", version="0.1.0")
 
+# Allow your UI to call the API from the browser
+app.add_middleware(
+    CORSMiddleware,
+    # For security, later replace "*" with your exact UI origin(s), e.g. "https://yourproject.lovable.dev"
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+    max_age=86400,
+)
 
 # ---------- Models ----------
 class Program(BaseModel):
@@ -21,7 +31,6 @@ class Program(BaseModel):
     base_sum_eur: float = Field(..., description="Apdrošinājuma summa pamatpolisei, EUR")
     premium_eur: float = Field(..., description="Pamatpolises prēmija 1 darbiniekam, EUR")
     payment_method: Optional[str] = Field(None, description="Pakalpojuma apmaksas veids")
-    # pilna tabula: LV atslēga -> vērtība
     features: Dict[str, Any] = Field(default_factory=dict)
 
 
