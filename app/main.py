@@ -1,14 +1,17 @@
-import traceback
-import tempfile
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
 import os
+import tempfile
+import traceback
+from typing import Any, Dict, List, Optional
+
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import JSONResponse, RedirectResponse
+from pydantic import BaseModel, Field
+
 from app.parsers.router import parse_document
 from app.ai.extract import ai_enrich_and_validate
 
 app = FastAPI(title="Insurance Offer Extractor", version="0.1.0")
+
 
 class Program(BaseModel):
     # Core fields
@@ -20,16 +23,24 @@ class Program(BaseModel):
     # Full 25-row table as LV keys -> value (string/number)
     features: Dict[str, Any] = Field(default_factory=dict)
 
+
 class ExtractionResult(BaseModel):
     source_file: str
     programs: List[Program] = Field(default_factory=list)
+    inquiry_id: Optional[int] = None  # ← echo back what UI sent
+
 
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
 
+
 @app.post("/ingest", response_model=ExtractionResult)
-async def ingest(file: UploadFile = File(...), company_hint: Optional[str] = Form(None)):
+async def ingest(
+    file: UploadFile = File(...),
+    company_hint: Optional[str] = Form(None),
+    inquiry_id: Optional[int] = Form(None),  # ← accept from form
+):
     try:
         # save to tmp (Windows-safe)
         tempdir = tempfile.gettempdir()
@@ -51,7 +62,7 @@ async def ingest(file: UploadFile = File(...), company_hint: Optional[str] = For
             pass
 
         # ensure response is Program (not ProgramModel)
-        progs = []
+        progs: List[Program] = []
         for p in programs:
             if hasattr(p, "model_dump"):
                 data = p.model_dump()
@@ -61,8 +72,11 @@ async def ingest(file: UploadFile = File(...), company_hint: Optional[str] = For
                 data = dict(p)
             progs.append(Program(**data))
 
-        return ExtractionResult(source_file=file.filename, programs=progs)
-
+        return ExtractionResult(
+            source_file=file.filename,
+            programs=progs,
+            inquiry_id=inquiry_id,  # ← return it
+        )
 
     except Exception as e:
         # return error details so we can see the cause
@@ -72,13 +86,9 @@ async def ingest(file: UploadFile = File(...), company_hint: Optional[str] = For
         )
 
 
-
-from fastapi.responses import RedirectResponse
-
 @app.get("/", include_in_schema=False)
 def root():
     return RedirectResponse(url="/docs")
-
 
 
 @app.get("/db/ping")
@@ -88,6 +98,7 @@ def db_ping():
     Returns server version and whether the 'offers' table exists.
     """
     import psycopg  # local import
+
     uri = os.getenv("DB_URI")
     if not uri:
         raise HTTPException(status_code=500, detail="DB_URI not set")
@@ -97,14 +108,16 @@ def db_ping():
             with conn.cursor() as cur:
                 cur.execute("select version()")
                 version = cur.fetchone()[0]
-                cur.execute("""
+                cur.execute(
+                    """
                     select exists (
                         select 1
                         from information_schema.tables
                         where table_schema = 'public'
                           and table_name   = 'offers'
                     )
-                """)
+                    """
+                )
                 has_offers = cur.fetchone()[0]
         return {"ok": True, "version": version, "offers_table": has_offers}
     except Exception as e:
