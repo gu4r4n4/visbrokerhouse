@@ -4,3 +4,4 @@ pydantic
 asgiref
 python-multipart
 gunicorn>=21.2
+python-docx>=1.1
