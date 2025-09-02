@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+pydantic
+asgiref
+python-multipart

@@ -1,0 +1,6 @@
+PassengerEnabled on
+PassengerAppRoot "/home2/lvtours/public_html/vis"
+PassengerBaseURI "/"
+PassengerPython "/home2/lvtours/virtualenv/public_html/vis/3.12/bin/python"
+PassengerAppType wsgi
+PassengerStartupFile passenger_wsgi.py
