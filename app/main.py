@@ -140,6 +140,7 @@ def _save_offers_to_db(
                 for p in programs:
                     data = p.model_dump() if hasattr(p, "model_dump") else dict(p)
                     try:
+                        # First try with provided inquiry_id (may be None)
                         cur.execute(
                             """
                             INSERT INTO public.offers
@@ -156,7 +157,7 @@ def _save_offers_to_db(
                                 data.get("program_code"),
                                 "api",
                                 source_file,
-                                inquiry_id,  # may be None or invalid
+                                inquiry_id,  # may be None; FK only checked when not null
                                 data.get("base_sum_eur"),
                                 data.get("premium_eur"),
                                 data.get("payment_method"),
@@ -166,15 +167,9 @@ def _save_offers_to_db(
                             ),
                         )
                         ids.append(cur.fetchone()[0])
-                    except Exception as e:
-                        # If FK error or anything related to inquiry_id, retry with NULL
-                        try:
-                            import psycopg as _pg
-                            if isinstance(e, getattr(_pg.errors, "ForeignKeyViolation", tuple())):
-                                raise
-                        except Exception:
-                            pass  # psycopg.errors may not resolve nicely in some envs; continue to retry
 
+                    except psycopg.errors.ForeignKeyViolation:
+                        # Bad inquiry_id → retry once with NULL
                         cur.execute(
                             """
                             INSERT INTO public.offers
@@ -200,11 +195,18 @@ def _save_offers_to_db(
                             ),
                         )
                         ids.append(cur.fetchone()[0])
+
+                    except Exception as e:
+                        # Log and continue with remaining programs
+                        print("DB insert for one program failed:", e)
+
             conn.commit()
         return ids
+
     except Exception as e:
-        print("DB insert failed:", e)
+        print("DB insert failed (connection-level):", e)
         return []
+
 
 
 # ---------- Routes ----------
