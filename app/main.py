@@ -105,7 +105,8 @@ def _save_offers_to_db(
 ) -> List[int]:
     """
     Inserts parsed offers into public.offers and returns their IDs.
-    If DB_URI is missing or insert fails, returns [] without failing the request.
+    If inquiry_id is missing/invalid, falls back to NULL (so offers are still saved).
+    If DB_URI is missing or insert fails completely, returns [] without failing the request.
     """
     uri = os.getenv("DB_URI")
     if not uri:
@@ -120,32 +121,60 @@ def _save_offers_to_db(
             with conn.cursor() as cur:
                 for p in programs:
                     data = p.model_dump() if hasattr(p, "model_dump") else dict(p)
-                    cur.execute(
-                        """
-                        INSERT INTO public.offers
-                          (insurer, company_hint, program_code, source, filename, inquiry_id,
-                           base_sum_eur, premium_eur, payment_method, features, raw_json, status)
-                        VALUES
-                          (%s, %s, %s, %s, %s, %s,
-                           %s, %s, %s, %s, %s, %s)
-                        RETURNING id
-                        """,
-                        (
-                            data.get("insurer"),
-                            company_hint,
-                            data.get("program_code"),
-                            "api",
-                            source_file,
-                            inquiry_id,
-                            data.get("base_sum_eur"),
-                            data.get("premium_eur"),
-                            data.get("payment_method"),
-                            Json(data.get("features") or {}),
-                            Json(data),
-                            "parsed",
-                        ),
-                    )
-                    ids.append(cur.fetchone()[0])
+                    try:
+                        cur.execute(
+                            """
+                            INSERT INTO public.offers
+                              (insurer, company_hint, program_code, source, filename, inquiry_id,
+                               base_sum_eur, premium_eur, payment_method, features, raw_json, status)
+                            VALUES
+                              (%s, %s, %s, %s, %s, %s,
+                               %s, %s, %s, %s, %s, %s)
+                            RETURNING id
+                            """,
+                            (
+                                data.get("insurer"),
+                                company_hint,
+                                data.get("program_code"),
+                                "api",
+                                source_file,
+                                inquiry_id,  # may be None or invalid
+                                data.get("base_sum_eur"),
+                                data.get("premium_eur"),
+                                data.get("payment_method"),
+                                Json(data.get("features") or {}),
+                                Json(data),
+                                "parsed",
+                            ),
+                        )
+                        ids.append(cur.fetchone()[0])
+                    except psycopg.errors.ForeignKeyViolation:
+                        # if bad inquiry_id → retry with NULL
+                        cur.execute(
+                            """
+                            INSERT INTO public.offers
+                              (insurer, company_hint, program_code, source, filename, inquiry_id,
+                               base_sum_eur, premium_eur, payment_method, features, raw_json, status)
+                            VALUES
+                              (%s, %s, %s, %s, %s, NULL,
+                               %s, %s, %s, %s, %s, %s)
+                            RETURNING id
+                            """,
+                            (
+                                data.get("insurer"),
+                                company_hint,
+                                data.get("program_code"),
+                                "api",
+                                source_file,
+                                data.get("base_sum_eur"),
+                                data.get("premium_eur"),
+                                data.get("payment_method"),
+                                Json(data.get("features") or {}),
+                                Json(data),
+                                "parsed",
+                            ),
+                        )
+                        ids.append(cur.fetchone()[0])
             conn.commit()
         return ids
     except Exception as e:
@@ -232,7 +261,9 @@ async def ingest(
         )
 
 
+# Accept both POST and PATCH for UI compatibility
 @app.post("/inquiries/{inquiry_id}/meta")
+@app.patch("/inquiries/{inquiry_id}/meta")
 def update_inquiry_metadata(inquiry_id: int, payload: InquiryMeta):
     """
     Optional endpoint for the UI to explicitly save inquiry meta.
@@ -241,7 +272,6 @@ def update_inquiry_metadata(inquiry_id: int, payload: InquiryMeta):
     if payload.company_name is None and payload.employees_count is None:
         raise HTTPException(status_code=400, detail="No fields to update")
 
-    # Reuse the same helper
     _maybe_update_inquiry_meta(
         inquiry_id,
         company_name=payload.company_name,
