@@ -37,6 +37,31 @@ def normalize_features(raw: dict, insurer: str, program_code: str, premium_eur: 
         norm["Pamatpolises prēmija 1 darbiniekam"] = premium_eur
     return norm
 
+# ----------------- STRICT company_hint → code mapping -----------------
+def _company_hint_to_code(hint: Optional[str]) -> Optional[str]:
+    """
+    Map company_hint to the strict codes required by the UI.
+    - BTA/BTA2 normalize to brand 'BTA' (special logic stays elsewhere).
+    - Other supported insurers map to EXACT codes below (and nothing else).
+    - If no match, return the original hint unchanged (do NOT invent codes).
+    """
+    if not hint:
+        return None
+    raw = hint
+    h = raw.strip().lower()
+    if h.startswith("bta"):
+        return "BTA"
+    mapping = {
+        "compensa": "COM_VA",
+        "seesam": "SEE_VA",
+        "balta": "BAL_VA",
+        "ban": "BAN_VA",
+        "ergo": "ERG_VA",
+        "gjensidige": "GJE_VA",
+        "if": "IFI_VA",
+    }
+    return mapping.get(h, raw)
+
 # ----------------- DTOs -----------------
 class ProgramModel(BaseModel):
     insurer: str
@@ -986,8 +1011,6 @@ def fill_bta_detail_fields(features: dict, parsed: Dict[str, Any]) -> dict:
 
 
 
-
-
 def _apply_bta_bottom_rules(features: dict, addons: Dict[str, Optional[float]]) -> dict:
     """
     EXACTLY your requested bottom rows for BTA main programs.
@@ -1628,8 +1651,8 @@ async def ai_enrich_and_validate(parsed: Dict[str, Any], company_hint: str | Non
         programs = extracted.programs
 
         if company_hint:
-            # ensure insurer normalization (e.g., 'bta2' → 'BTA')
-            normalized_insurer = "BTA" if hint.startswith("bta") else company_hint
+            # >>> STRICT insurer normalization for non-BTA <<<
+            normalized_insurer = _company_hint_to_code(company_hint) or company_hint
             for p in programs:
                 p.insurer = normalized_insurer
                 p.features = normalize_features(
@@ -1663,8 +1686,8 @@ def fallback_naive(parsed: Dict[str, Any], company_hint: str | None) -> List[Pro
     text = parsed.get("raw_text") or ""
     raw_hint = (company_hint or "").strip()
     insurer_hint = raw_hint.lower()
-    # normalize 'bta2' etc. to branded insurer
-    insurer = "BTA" if insurer_hint.startswith("bta") else (raw_hint or "Nezināms")
+    # normalize with STRICT mapping (BTA/BTA2 → 'BTA'; others to fixed codes)
+    insurer = _company_hint_to_code(raw_hint) or (raw_hint or "Nezināms")
 
     program_code = "PROGRAMMA_1"
     if "VARIANTS" in text.upper(): program_code = "V1 PLUSS C10"
