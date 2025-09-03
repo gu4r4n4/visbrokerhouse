@@ -3,7 +3,7 @@ import tempfile
 import traceback
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
@@ -12,13 +12,12 @@ from app.ai.extract import ai_enrich_and_validate
 
 from fastapi.middleware.cors import CORSMiddleware
 
-
 app = FastAPI(title="Insurance Offer Extractor", version="0.1.0")
 
 # Allow your UI to call the API from the browser
 app.add_middleware(
     CORSMiddleware,
-    # For security, later replace "*" with your exact UI origin(s)
+    # TODO: lock down to ["https://lovable.dev"] when ready
     allow_origins=["*"],
     allow_methods=["GET", "POST", "OPTIONS", "PATCH"],
     allow_headers=["*"],
@@ -40,6 +39,21 @@ class ExtractionResult(BaseModel):
     programs: List[Program] = Field(default_factory=list)
     inquiry_id: Optional[int] = None
     offer_ids: List[int] = Field(default_factory=list)
+
+
+class InquiryMeta(BaseModel):
+    company_name: Optional[str] = None
+    employees_count: Optional[int] = None
+
+
+class ShareCreate(BaseModel):
+    inquiry_id: int
+    # default 30 days; None means no expiry
+    expires_in_hours: Optional[int] = 720
+
+
+class ShareTokenOut(BaseModel):
+    token: str
 
 
 # ---------- Helpers ----------
@@ -216,6 +230,64 @@ async def ingest(
             status_code=500,
             content={"error": str(e), "trace": traceback.format_exc()},
         )
+
+
+@app.post("/inquiries/{inquiry_id}/meta")
+def update_inquiry_metadata(inquiry_id: int, payload: InquiryMeta):
+    """
+    Optional endpoint for the UI to explicitly save inquiry meta.
+    Succeeds even if only one field is provided. 404/400 guarded below.
+    """
+    if payload.company_name is None and payload.employees_count is None:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    # Reuse the same helper
+    _maybe_update_inquiry_meta(
+        inquiry_id,
+        company_name=payload.company_name,
+        employees_count=payload.employees_count,
+    )
+    return {"ok": True}
+
+
+@app.post("/shares", response_model=ShareTokenOut)
+def create_share_token(payload: ShareCreate):
+    """
+    Mint a share token bound to an inquiry_id. UI will build the public URL.
+    """
+    uri = os.getenv("DB_URI")
+    if not uri:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="DB unavailable",
+        )
+
+    import secrets
+    from datetime import datetime, timedelta
+    import psycopg
+
+    token = secrets.token_urlsafe(24)
+    expires_at = None
+    if payload.expires_in_hours and payload.expires_in_hours > 0:
+        expires_at = datetime.utcnow() + timedelta(hours=payload.expires_in_hours)
+
+    try:
+        with psycopg.connect(uri, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    insert into public.share_links (token, inquiry_id, expires_at)
+                    values (%s, %s, %s)
+                    returning token
+                    """,
+                    (token, payload.inquiry_id, expires_at),
+                )
+                row = cur.fetchone()
+                return {"token": row[0]}
+    except psycopg.errors.ForeignKeyViolation:
+        raise HTTPException(status_code=400, detail="Invalid inquiry_id")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create share token: {e}")
 
 
 @app.get("/", include_in_schema=False)
