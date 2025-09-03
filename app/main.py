@@ -12,6 +12,7 @@ from app.ai.extract import ai_enrich_and_validate
 
 from fastapi.middleware.cors import CORSMiddleware
 
+
 app = FastAPI(title="Insurance Offer Extractor", version="0.1.0")
 
 # Allow your UI to call the API from the browser
@@ -46,14 +47,31 @@ class InquiryMeta(BaseModel):
     employees_count: Optional[int] = None
 
 
-class ShareCreate(BaseModel):
-    inquiry_id: int
-    # default 30 days; None means no expiry
+# ----- Share link models (no inquiry_id) -----
+class ShareResult(BaseModel):
+    source_file: str
+    programs: List[Program]
+
+
+class ShareSnapshotIn(BaseModel):
+    """
+    Snapshot payload coming from the UI to be shared publicly.
+    """
+    company_name: Optional[str] = None
+    employees_count: Optional[int] = None
+    results: List[ShareResult] = Field(default_factory=list)
+    # default 30 days; None => no expiry
     expires_in_hours: Optional[int] = 720
 
 
 class ShareTokenOut(BaseModel):
     token: str
+
+
+class ShareViewOut(BaseModel):
+    company_name: Optional[str] = None
+    employees_count: Optional[int] = None
+    results: List[ShareResult] = Field(default_factory=list)
 
 
 # ---------- Helpers ----------
@@ -148,8 +166,15 @@ def _save_offers_to_db(
                             ),
                         )
                         ids.append(cur.fetchone()[0])
-                    except psycopg.errors.ForeignKeyViolation:
-                        # if bad inquiry_id → retry with NULL
+                    except Exception as e:
+                        # If FK error or anything related to inquiry_id, retry with NULL
+                        try:
+                            import psycopg as _pg
+                            if isinstance(e, getattr(_pg.errors, "ForeignKeyViolation", tuple())):
+                                raise
+                        except Exception:
+                            pass  # psycopg.errors may not resolve nicely in some envs; continue to retry
+
                         cur.execute(
                             """
                             INSERT INTO public.offers
@@ -280,10 +305,12 @@ def update_inquiry_metadata(inquiry_id: int, payload: InquiryMeta):
     return {"ok": True}
 
 
+# -------- Share links WITHOUT inquiry_id (snapshot storage) --------
 @app.post("/shares", response_model=ShareTokenOut)
-def create_share_token(payload: ShareCreate):
+def create_share_token(payload: ShareSnapshotIn):
     """
-    Mint a share token bound to an inquiry_id. UI will build the public URL.
+    Store a snapshot payload (company meta + results) under a random token.
+    Returns { token } that can be used at GET /shares/{token}.
     """
     uri = os.getenv("DB_URI")
     if not uri:
@@ -295,29 +322,86 @@ def create_share_token(payload: ShareCreate):
     import secrets
     from datetime import datetime, timedelta
     import psycopg
+    from psycopg.types.json import Json
 
     token = secrets.token_urlsafe(24)
     expires_at = None
     if payload.expires_in_hours and payload.expires_in_hours > 0:
         expires_at = datetime.utcnow() + timedelta(hours=payload.expires_in_hours)
 
+    snapshot = {
+        "company_name": payload.company_name,
+        "employees_count": payload.employees_count,
+        "results": [r.model_dump() for r in payload.results],
+    }
+
     try:
         with psycopg.connect(uri, autocommit=True) as conn:
             with conn.cursor() as cur:
+                # Requires table: public.share_links(token text unique, payload jsonb, created_at timestamptz default now(), expires_at timestamptz null)
                 cur.execute(
                     """
-                    insert into public.share_links (token, inquiry_id, expires_at)
+                    insert into public.share_links (token, payload, expires_at)
                     values (%s, %s, %s)
                     returning token
                     """,
-                    (token, payload.inquiry_id, expires_at),
+                    (token, Json(snapshot), expires_at),
                 )
                 row = cur.fetchone()
                 return {"token": row[0]}
-    except psycopg.errors.ForeignKeyViolation:
-        raise HTTPException(status_code=400, detail="Invalid inquiry_id")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create share token: {e}")
+
+
+@app.get("/shares/{token}", response_model=ShareViewOut)
+def resolve_share_token(token: str):
+    """
+    Resolve a token and return the stored snapshot.
+    404 if token not found or expired.
+    """
+    uri = os.getenv("DB_URI")
+    if not uri:
+        raise HTTPException(status_code=503, detail="DB unavailable")
+
+    import psycopg
+    from datetime import datetime, timezone
+
+    with psycopg.connect(uri) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "select payload, expires_at from public.share_links where token = %s",
+                (token,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Share link not found")
+
+            payload, expires_at = row
+
+            if expires_at is not None:
+                now = datetime.now(timezone.utc)
+                if getattr(expires_at, "tzinfo", None) is None:
+                    expires_at = expires_at.replace(tzinfo=timezone.utc)
+                if now > expires_at:
+                    raise HTTPException(status_code=404, detail="Share link expired")
+
+    # payload is JSON with company_name, employees_count, results[]
+    try:
+        company_name = payload.get("company_name")
+        employees_count = payload.get("employees_count")
+        results_in = payload.get("results") or []
+        # Validate/normalize into ShareResult -> Program models
+        results_out: List[ShareResult] = []
+        for r in results_in:
+            progs = [Program(**p) for p in (r.get("programs") or [])]
+            results_out.append(ShareResult(source_file=r.get("source_file") or "unknown", programs=progs))
+        return ShareViewOut(
+            company_name=company_name,
+            employees_count=employees_count,
+            results=results_out,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Corrupt snapshot payload: {e}")
 
 
 @app.get("/", include_in_schema=False)
