@@ -12,12 +12,13 @@ from app.ai.extract import ai_enrich_and_validate
 
 from fastapi.middleware.cors import CORSMiddleware
 
+
 app = FastAPI(title="Insurance Offer Extractor", version="0.1.0")
 
 # Allow your UI to call the API from the browser
 app.add_middleware(
     CORSMiddleware,
-    # For security, later replace "*" with your exact UI origin(s), e.g. "https://yourproject.lovable.dev"
+    # For security, later replace "*" with your exact UI origin(s)
     allow_origins=["*"],
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
@@ -47,6 +48,9 @@ def _save_offers_to_db(
     source_file: str,
     company_hint: Optional[str],
     inquiry_id: Optional[int],
+    *,
+    company_name: Optional[str],
+    employee_count: Optional[int],
 ) -> List[int]:
     """
     Inserts parsed offers into public.offers and returns their IDs.
@@ -70,10 +74,12 @@ def _save_offers_to_db(
                         """
                         INSERT INTO public.offers
                           (insurer, company_hint, program_code, source, filename, inquiry_id,
-                           base_sum_eur, premium_eur, payment_method, features, raw_json, status)
+                           base_sum_eur, premium_eur, payment_method, features, raw_json, status,
+                           company_name, employee_count)
                         VALUES
                           (%s, %s, %s, %s, %s, %s,
-                           %s, %s, %s, %s, %s, %s)
+                           %s, %s, %s, %s, %s, %s,
+                           %s, %s)
                         RETURNING id
                         """,
                         (
@@ -89,6 +95,8 @@ def _save_offers_to_db(
                             Json(data.get("features") or {}),
                             Json(data),
                             "parsed",
+                            company_name,
+                            employee_count,
                         ),
                     )
                     ids.append(cur.fetchone()[0])
@@ -111,7 +119,14 @@ async def ingest(
     file: UploadFile = File(...),
     company_hint: Optional[str] = Form(None),
     inquiry_id: Optional[int] = Form(None),
+    # NEW: extra form fields saved to DB (not required in response)
+    company_name: Optional[str] = Form(None),
+    employee_count: Optional[int] = Form(None),
 ):
+    """
+    Accepts a PDF + metadata, parses & enriches programs, returns JSON and saves to DB.
+    NOTE: send employee_count as a NUMBER (e.g., 45), not text like "~ 45 cilvēki".
+    """
     try:
         # save to tmp (Windows-safe)
         tempdir = tempfile.gettempdir()
@@ -143,6 +158,8 @@ async def ingest(
             source_file=file.filename or safe_name,
             company_hint=company_hint,
             inquiry_id=inquiry_id,
+            company_name=company_name,
+            employee_count=employee_count,
         )
 
         # cleanup
