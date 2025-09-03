@@ -20,7 +20,7 @@ app.add_middleware(
     CORSMiddleware,
     # For security, later replace "*" with your exact UI origin(s)
     allow_origins=["*"],
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "OPTIONS", "PATCH"],
     allow_headers=["*"],
     max_age=86400,
 )
@@ -43,14 +43,51 @@ class ExtractionResult(BaseModel):
 
 
 # ---------- Helpers ----------
+def _maybe_update_inquiry_meta(
+    inquiry_id: Optional[int],
+    *,
+    company_name: Optional[str],
+    employees_count: Optional[int],
+) -> None:
+    """
+    If inquiry_id and at least one field provided, update
+    public.insurance_inquiries(company_name, employees_count).
+    Silently no-ops if DB_URI is missing.
+    """
+    if not inquiry_id:
+        return
+    if company_name is None and employees_count is None:
+        return
+
+    uri = os.getenv("DB_URI")
+    if not uri:
+        return
+
+    try:
+        import psycopg
+        with psycopg.connect(uri) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE public.insurance_inquiries
+                    SET
+                      company_name    = COALESCE(%s, company_name),
+                      employees_count = COALESCE(%s, employees_count)
+                    WHERE id = %s
+                    """,
+                    (company_name, employees_count, inquiry_id),
+                )
+            conn.commit()
+    except Exception as e:
+        # Don't break the request just because meta update failed
+        print("Inquiry meta update failed:", e)
+
+
 def _save_offers_to_db(
     programs: List[Program | Dict[str, Any]],
     source_file: str,
     company_hint: Optional[str],
     inquiry_id: Optional[int],
-    *,
-    company_name: Optional[str],
-    employee_count: Optional[int],
 ) -> List[int]:
     """
     Inserts parsed offers into public.offers and returns their IDs.
@@ -58,7 +95,6 @@ def _save_offers_to_db(
     """
     uri = os.getenv("DB_URI")
     if not uri:
-        # DB not configured: just skip writes
         return []
 
     try:
@@ -74,12 +110,10 @@ def _save_offers_to_db(
                         """
                         INSERT INTO public.offers
                           (insurer, company_hint, program_code, source, filename, inquiry_id,
-                           base_sum_eur, premium_eur, payment_method, features, raw_json, status,
-                           company_name, employee_count)
+                           base_sum_eur, premium_eur, payment_method, features, raw_json, status)
                         VALUES
                           (%s, %s, %s, %s, %s, %s,
-                           %s, %s, %s, %s, %s, %s,
-                           %s, %s)
+                           %s, %s, %s, %s, %s, %s)
                         RETURNING id
                         """,
                         (
@@ -95,15 +129,12 @@ def _save_offers_to_db(
                             Json(data.get("features") or {}),
                             Json(data),
                             "parsed",
-                            company_name,
-                            employee_count,
                         ),
                     )
                     ids.append(cur.fetchone()[0])
             conn.commit()
         return ids
     except Exception as e:
-        # Don’t break the whole request on DB failure
         print("DB insert failed:", e)
         return []
 
@@ -119,7 +150,7 @@ async def ingest(
     file: UploadFile = File(...),
     company_hint: Optional[str] = Form(None),
     inquiry_id: Optional[int] = Form(None),
-    # NEW: extra form fields saved to DB (not required in response)
+    # Extra form fields coming from UI (saved to inquiry meta, not required in response)
     company_name: Optional[str] = Form(None),
     employee_count: Optional[int] = Form(None),
 ):
@@ -152,14 +183,19 @@ async def ingest(
                 data = dict(p)
             progs.append(Program(**data))
 
-        # write to DB (if configured)
+        # best-effort: update inquiry meta if provided
+        _maybe_update_inquiry_meta(
+            inquiry_id,
+            company_name=company_name,
+            employees_count=employee_count,
+        )
+
+        # write offers to DB (if configured)
         offer_ids = _save_offers_to_db(
             programs=progs,
             source_file=file.filename or safe_name,
             company_hint=company_hint,
             inquiry_id=inquiry_id,
-            company_name=company_name,
-            employee_count=employee_count,
         )
 
         # cleanup
@@ -211,7 +247,7 @@ def db_ping():
                         where table_schema = 'public'
                           and table_name   = 'offers'
                     )
-                """
+                    """
                 )
                 has_offers = cur.fetchone()[0]
         return {"ok": True, "version": version, "offers_table": has_offers}
