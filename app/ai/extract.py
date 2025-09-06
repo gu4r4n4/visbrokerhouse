@@ -1393,6 +1393,10 @@ def com_programs(parsed: Dict[str, Any]) -> List[ProgramModel]:
             or _amount_near_kw(raw_text, "Prēmija vienai personai, EUR", min_v=50, max_v=100_000)
             or 0.0
         )
+        
+        
+    if os.getenv("DEBUG_COM"):
+        print("COM premium source=COM_TABLE", "value=", premium)
 
 
     # ---- features ----
