@@ -1249,30 +1249,40 @@ def com_programs(parsed: Dict[str, Any]) -> List[ProgramModel]:
         program_code_text = _norm_text(m.group(1)) if m else "Pamatprogramma"
     program_code_text = _norm_text(program_code_text)
 
-    # ---- base_sum_eur ----
-    base_sum = (
-        _amount_from_tables_by_header_in_titled_table(
-            parsed,
-            r"PAMATPROGRAMMA\s+UN\s+PAPILDU\s+SEGUMS",
-            r"Apdrošinājuma\s+summa\s+vienai\s+personai,\s*EUR",
-            pick="first", min_v=1, max_v=10_000_000
-        )
-        or _amount_from_tables_by_column_header(
-            parsed, r"Apdrošinājuma\s+summa\s+vienai\s+personai,\s*EUR",
-            pick="first", min_v=1, max_v=10_000_000
-        )
-        or _amount_near_kw(  # NEW: matches the green sentence variant
-            raw_text,
-            "Pamatprogrammas apdrošinājuma summa vienai personai",
-            max_v=10_000_000
-        )
-        or _amount_near_kw(
-            raw_text,
-            "Apdrošinājuma summa vienai personai, EUR",
-            max_v=10_000_000
-        )
-        or 0.0
+# ---- base_sum_eur ----
+# First try the exact green sentence variant (appears only once in text)
+    m_green = re.search(
+        r"Pamatprogrammas\s+apdrošinājuma\s+summa\s+vienai\s+personai[^\d%]{0,40}([0-9][0-9 \u00A0\.,]+)",
+        raw_text, re.IGNORECASE
     )
+    base_sum = _num_safe(m_green.group(1)) if m_green else None
+    
+    if not base_sum:
+        base_sum = (
+            _amount_from_tables_by_header_in_titled_table(
+                parsed,
+                r"PAMATPROGRAMMA\s+UN\s+PAPILDU\s+SEGUMS",
+                r"Apdrošinājuma\s+summa\s+vienai\s+personai,\s*EUR",
+                pick="first", min_v=1, max_v=10_000_000
+            )
+            or _amount_from_tables_by_column_header(
+                parsed, r"Apdrošinājuma\s+summa\s+vienai\s+personai,\s*EUR",
+                pick="first", min_v=1, max_v=10_000_000
+            )
+            # Require min_v=100 so we don’t accidentally grab “1.” section numbers
+            or _amount_near_kw(
+                raw_text,
+                "Pamatprogrammas apdrošinājuma summa vienai personai",
+                min_v=100, max_v=10_000_000
+            )
+            or _amount_near_kw(
+                raw_text,
+                "Apdrošinājuma summa vienai personai, EUR",
+                min_v=100, max_v=10_000_000
+            )
+            or 0.0
+        )
+
 
     # ---- premium_eur ----
     premium = (
