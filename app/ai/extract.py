@@ -1284,98 +1284,117 @@ def com_programs(parsed: Dict[str, Any]) -> List[ProgramModel]:
         )
 
 
-    # ---- premium_eur ----  ⟵ REPLACE THIS WHOLE BLOCK IN com_programs ONLY
+# ---- premium_eur ----
     premium = None
-
     try:
         tables = parsed.get("tables") or []
         title_ok  = re.compile(r"PAMATPROGRAMMA\s+UN\s+PAPILDU\s+SEGUMS", re.IGNORECASE)
         title_bad = re.compile(r"\bPAPILDPROGRAMMAS\b", re.IGNORECASE)
         hdr_prem  = re.compile(r"Prēmija\s+vienai\s*[\r\n ]*personai,\s*EUR", re.IGNORECASE)
         hdr_sum   = re.compile(r"Apdrošinājuma\s+summa\s+vienai\s*[\r\n ]*personai,\s*EUR", re.IGNORECASE)
-
+    
         def _stacked_header(tbl, depth, c):
             parts = []
             for rr in range(depth):
                 if c < len(tbl[rr]):
                     parts.append(_norm_text(tbl[rr][c]))
             return " ".join(parts)
-
-        def _first_number_under(tbl, col, start_row, scan_rows=40):
-            vals = []
+    
+        def _first_number_under(tbl, col, start_row, scan_rows=40, min_v=50, max_v=10000):
             for rr in range(start_row, min(len(tbl), start_row + scan_rows)):
                 if col < len(tbl[rr]):
                     nums = _extract_numbers_no_percent(_norm_text(tbl[rr][col]))
                     for n in nums:
-                        if 50 <= n <= 10000:
-                            vals.append(n)
-                            break
-            return vals[0] if vals else None
-
-        # -------- (1) Titled table: "PAMATPROGRAMMA UN PAPILDU SEGUMS"
-        for tbl in tables:
+                        if min_v <= n <= max_v:
+                            return n
+            return None
+    
+        # -------- (1) Titled table + neighbor peek (for skinny premium table)
+        for i, tbl in enumerate(tables):
             if not tbl:
                 continue
-            # Title may be in a separate header row; build a title out of a few first rows
+    
+            # build a loose title out of first few rows
             title_blob = " ".join(
-                " ".join(_norm_text(c) for c in (tbl[i] or []))
-                for i in range(0, min(4, len(tbl)))
+                " ".join(_norm_text(c) for c in (tbl[r] or []))
+                for r in range(0, min(4, len(tbl)))
             )
             if not title_ok.search(title_blob) or title_bad.search(title_blob):
                 continue
-
+    
             depth = min(8, len(tbl))
             max_cols = max((len(r) for r in tbl[:depth] if r), default=0)
-
+    
             prem_col = None
             for c in range(max_cols):
                 if hdr_prem.search(_stacked_header(tbl, depth, c)):
                     prem_col = c
                     break
-            if prem_col is None:
-                continue
-
-            pval = _first_number_under(tbl, prem_col, depth)
-            if pval is not None:
-                premium = pval
-                break
-
-        # -------- (2) Header-pair fallback (handles when title row is in a separate table)
+    
+            # Try inside the same table first
+            if prem_col is not None:
+                pval = _first_number_under(tbl, prem_col, depth)
+                if pval is not None:
+                    premium = pval
+                    break
+    
+            # <— NEW: neighbor tables (skinny premium column split out by the PDF)
+            # Right neighbor
+            if i + 1 < len(tables) and tables[i + 1]:
+                tR = tables[i + 1]
+                depthR = min(8, len(tR))
+                max_colsR = max((len(r) for r in tR[:depthR] if r), default=0)
+                for c in range(max_colsR):
+                    if hdr_prem.search(_stacked_header(tR, depthR, c)):
+                        pval = _first_number_under(tR, c, depthR)
+                        if pval is not None:
+                            premium = pval
+                            break
+                if premium is not None:
+                    break
+    
+            # Left neighbor (rare, but cheap to try)
+            if i - 1 >= 0 and tables[i - 1]:
+                tL = tables[i - 1]
+                depthL = min(8, len(tL))
+                max_colsL = max((len(r) for r in tL[:depthL] if r), default=0)
+                for c in range(max_colsL):
+                    if hdr_prem.search(_stacked_header(tL, depthL, c)):
+                        pval = _first_number_under(tL, c, depthL)
+                        if pval is not None:
+                            premium = pval
+                            break
+                if premium is not None:
+                    break
+    
+        # -------- (2) Header-pair fallback (unchanged) ...
         if premium is None:
             for tbl in tables:
                 if not tbl:
                     continue
-
-                # Exclude the PAPILDPROGRAMMAS grid by looking at the first few rows
                 top_blob = " ".join(
                     " ".join(_norm_text(c) for c in (tbl[i] or []))
                     for i in range(0, min(5, len(tbl)))
                 )
                 if title_bad.search(top_blob):
                     continue
-
                 depth = min(8, len(tbl))
                 max_cols = max((len(r) for r in tbl[:depth] if r), default=0)
-
-                prem_col = None
-                sum_col  = None
+                prem_col = sum_col = None
                 for c in range(max_cols):
                     head = _stacked_header(tbl, depth, c)
-                    if prem_col is None and hdr_prem.search(head):
-                        prem_col = c
-                    if sum_col is None and hdr_sum.search(head):
-                        sum_col = c
-
+                    if prem_col is None and hdr_prem.search(head): prem_col = c
+                    if sum_col  is None and hdr_sum.search(head):  sum_col  = c
                 if prem_col is None or sum_col is None:
                     continue
-
                 pval = _first_number_under(tbl, prem_col, depth)
                 if pval is not None:
                     premium = pval
                     break
-
+    
     except Exception:
         pass
+
 
     # -------- (3) Last-resort fallbacks
     if premium is None:
@@ -1393,10 +1412,6 @@ def com_programs(parsed: Dict[str, Any]) -> List[ProgramModel]:
             or _amount_near_kw(raw_text, "Prēmija vienai personai, EUR", min_v=50, max_v=100_000)
             or 0.0
         )
-        
-        
-    if os.getenv("DEBUG_COM"):
-        print("COM premium source=COM_TABLE", "value=", premium)
 
 
     # ---- features ----
