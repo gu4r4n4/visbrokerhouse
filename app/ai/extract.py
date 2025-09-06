@@ -1284,21 +1284,79 @@ def com_programs(parsed: Dict[str, Any]) -> List[ProgramModel]:
         )
 
 
-    # ---- premium_eur ----
-    premium = (
-        _amount_from_tables_by_header_in_titled_table(
-            parsed,
-            r"PAMATPROGRAMMA\s+UN\s+PAPILDU\s+SEGUMS",
-            r"Prēmija\s+vienai\s*[\r\n ]*personai,\s*EUR",
-            pick="first", min_v=1, max_v=100_000
+    # ---- premium_eur ----  ⟵ REPLACE THIS WHOLE BLOCK IN com_programs ONLY
+    premium = None
+
+    # Prefer the table titled "PAMATPROGRAMMA UN PAPILDU SEGUMS" (ignore "PAPILDPROGRAMMAS")
+    try:
+        tables = parsed.get("tables") or []
+        title_ok  = re.compile(r"PAMATPROGRAMMA\s+UN\s+PAPILDU\s+SEGUMS", re.IGNORECASE)
+        title_bad = re.compile(r"\bPAPILDPROGRAMMAS\b", re.IGNORECASE)
+        hdr_prem  = re.compile(r"Prēmija\s+vienai\s*[\r\n ]*personai,\s*EUR", re.IGNORECASE)
+
+        def _stacked_header(tbl, depth, col):
+            parts = []
+            for rr in range(depth):
+                if col < len(tbl[rr]):
+                    parts.append(_norm_text(tbl[rr][col]))
+            return " ".join(parts)
+
+        for tbl in tables:
+            if not tbl:
+                continue
+
+            # Compose a 'title' from the first few rows (headers often split across lines)
+            title = " ".join(
+                " ".join(_norm_text(c) for c in (tbl[i] or []))
+                for i in range(0, min(4, len(tbl)))
+            )
+            if not title_ok.search(title) or title_bad.search(title):
+                continue
+
+            # Find the "Prēmija vienai personai, EUR" column by stacked header
+            depth = min(8, len(tbl))
+            max_cols = max((len(r) for r in tbl[:depth] if r), default=0)
+
+            prem_col = None
+            for c in range(max_cols):
+                if hdr_prem.search(_stacked_header(tbl, depth, c)):
+                    prem_col = c
+                    break
+            if prem_col is None:
+                continue
+
+            # Read the first plausible premium below that header (50..10000)
+            vals = []
+            for rr in range(depth, min(len(tbl), depth + 40)):
+                if prem_col < len(tbl[rr]):
+                    nums = _extract_numbers_no_percent(_norm_text(tbl[rr][prem_col]))
+                    for n in nums:
+                        if 50 <= n <= 10000:
+                            vals.append(n)
+                            break
+            if vals:
+                premium = vals[0]   # first value in that column (should be 384)
+                break
+    except Exception:
+        pass
+
+    # Fallbacks if the targeted-table path didn't yield a value
+    if premium is None:
+        premium = (
+            _amount_from_tables_by_header_in_titled_table(
+                parsed,
+                r"PAMATPROGRAMMA\s+UN\s+PAPILDU\s+SEGUMS",
+                r"Prēmija\s+vienai\s*[\r\n ]*personai,\s*EUR",
+                pick="first", min_v=50, max_v=100_000
+            )
+            or _amount_from_tables_by_column_header(
+                parsed, r"Prēmija\s+vienai\s*[\r\n ]*personai,\s*EUR",
+                pick="first", min_v=50, max_v=100_000
+            )
+            or _amount_near_kw(raw_text, "Prēmija vienai personai, EUR", min_v=50, max_v=100_000)
+            or 0.0
         )
-        or _amount_from_tables_by_column_header(
-            parsed, r"Prēmija\s+vienai\s*[\r\n ]*personai,\s*EUR",
-            pick="first", min_v=1, max_v=100_000
-        )
-        or _amount_near_kw(raw_text, "Prēmija vienai personai, EUR", max_v=100_000)
-        or 0.0
-    )
+
 
     # ---- features ----
     feats = {
