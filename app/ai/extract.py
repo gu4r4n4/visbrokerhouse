@@ -1287,33 +1287,43 @@ def com_programs(parsed: Dict[str, Any]) -> List[ProgramModel]:
     # ---- premium_eur ----  ⟵ REPLACE THIS WHOLE BLOCK IN com_programs ONLY
     premium = None
 
-    # Prefer the table titled "PAMATPROGRAMMA UN PAPILDU SEGUMS" (ignore "PAPILDPROGRAMMAS")
     try:
         tables = parsed.get("tables") or []
         title_ok  = re.compile(r"PAMATPROGRAMMA\s+UN\s+PAPILDU\s+SEGUMS", re.IGNORECASE)
         title_bad = re.compile(r"\bPAPILDPROGRAMMAS\b", re.IGNORECASE)
         hdr_prem  = re.compile(r"Prēmija\s+vienai\s*[\r\n ]*personai,\s*EUR", re.IGNORECASE)
+        hdr_sum   = re.compile(r"Apdrošinājuma\s+summa\s+vienai\s*[\r\n ]*personai,\s*EUR", re.IGNORECASE)
 
-        def _stacked_header(tbl, depth, col):
+        def _stacked_header(tbl, depth, c):
             parts = []
             for rr in range(depth):
-                if col < len(tbl[rr]):
-                    parts.append(_norm_text(tbl[rr][col]))
+                if c < len(tbl[rr]):
+                    parts.append(_norm_text(tbl[rr][c]))
             return " ".join(parts)
 
+        def _first_number_under(tbl, col, start_row, scan_rows=40):
+            vals = []
+            for rr in range(start_row, min(len(tbl), start_row + scan_rows)):
+                if col < len(tbl[rr]):
+                    nums = _extract_numbers_no_percent(_norm_text(tbl[rr][col]))
+                    for n in nums:
+                        if 50 <= n <= 10000:
+                            vals.append(n)
+                            break
+            return vals[0] if vals else None
+
+        # -------- (1) Titled table: "PAMATPROGRAMMA UN PAPILDU SEGUMS"
         for tbl in tables:
             if not tbl:
                 continue
-
-            # Compose a 'title' from the first few rows (headers often split across lines)
-            title = " ".join(
+            # Title may be in a separate header row; build a title out of a few first rows
+            title_blob = " ".join(
                 " ".join(_norm_text(c) for c in (tbl[i] or []))
                 for i in range(0, min(4, len(tbl)))
             )
-            if not title_ok.search(title) or title_bad.search(title):
+            if not title_ok.search(title_blob) or title_bad.search(title_blob):
                 continue
 
-            # Find the "Prēmija vienai personai, EUR" column by stacked header
             depth = min(8, len(tbl))
             max_cols = max((len(r) for r in tbl[:depth] if r), default=0)
 
@@ -1325,22 +1335,49 @@ def com_programs(parsed: Dict[str, Any]) -> List[ProgramModel]:
             if prem_col is None:
                 continue
 
-            # Read the first plausible premium below that header (50..10000)
-            vals = []
-            for rr in range(depth, min(len(tbl), depth + 40)):
-                if prem_col < len(tbl[rr]):
-                    nums = _extract_numbers_no_percent(_norm_text(tbl[rr][prem_col]))
-                    for n in nums:
-                        if 50 <= n <= 10000:
-                            vals.append(n)
-                            break
-            if vals:
-                premium = vals[0]   # first value in that column (should be 384)
+            pval = _first_number_under(tbl, prem_col, depth)
+            if pval is not None:
+                premium = pval
                 break
+
+        # -------- (2) Header-pair fallback (handles when title row is in a separate table)
+        if premium is None:
+            for tbl in tables:
+                if not tbl:
+                    continue
+
+                # Exclude the PAPILDPROGRAMMAS grid by looking at the first few rows
+                top_blob = " ".join(
+                    " ".join(_norm_text(c) for c in (tbl[i] or []))
+                    for i in range(0, min(5, len(tbl)))
+                )
+                if title_bad.search(top_blob):
+                    continue
+
+                depth = min(8, len(tbl))
+                max_cols = max((len(r) for r in tbl[:depth] if r), default=0)
+
+                prem_col = None
+                sum_col  = None
+                for c in range(max_cols):
+                    head = _stacked_header(tbl, depth, c)
+                    if prem_col is None and hdr_prem.search(head):
+                        prem_col = c
+                    if sum_col is None and hdr_sum.search(head):
+                        sum_col = c
+
+                if prem_col is None or sum_col is None:
+                    continue
+
+                pval = _first_number_under(tbl, prem_col, depth)
+                if pval is not None:
+                    premium = pval
+                    break
+
     except Exception:
         pass
 
-    # Fallbacks if the targeted-table path didn't yield a value
+    # -------- (3) Last-resort fallbacks
     if premium is None:
         premium = (
             _amount_from_tables_by_header_in_titled_table(
