@@ -772,6 +772,74 @@ def _amount_from_tables_by_column_header(parsed: Dict[str, Any], header_regex: s
     return None
 
 
+def _amount_from_tables_by_header_in_titled_table(
+    parsed: Dict[str, Any],
+    table_title_regex: str,
+    header_regex: str,
+    pick: str = "first",
+    scan_rows: int = 40,
+    min_v: float = 0.0,
+    max_v: float = 1_000_000,
+) -> Optional[float]:
+    """Find value in a specific (titled) table under a stacked column header."""
+    tables = parsed.get("tables") or []
+    title_rgx = re.compile(table_title_regex, re.IGNORECASE | re.DOTALL)
+    hdr_rgx = re.compile(header_regex, re.IGNORECASE | re.DOTALL)
+
+    for tbl in tables:
+        if not tbl:
+            continue
+
+        # Build a 'title' from the first 2 rows (common in COM PDFs)
+        first = " ".join(_norm_text(c) for c in (tbl[0] or []))
+        second = " ".join(_norm_text(c) for c in (tbl[1] or [])) if len(tbl) > 1 else ""
+        title = (first + " " + second).strip()
+        if not title_rgx.search(title):
+            continue
+
+        # Locate the header column by stacked header (top 5 rows)
+        depth = min(5, len(tbl))
+        max_cols = max((len(r) for r in tbl[:depth] if r), default=0)
+
+        def stacked_header(col: int) -> str:
+            return " ".join(_norm_text(tbl[r][col]) for r in range(depth) if col < len(tbl[r]))
+
+        header_col = None
+        for c in range(max_cols):
+            if hdr_rgx.search(stacked_header(c)):
+                header_col = c
+                break
+        if header_col is None:
+            continue
+
+        # Collect plausible values below that header
+        vals: List[float] = []
+        for rr in range(depth, min(len(tbl), depth + scan_rows)):
+            if header_col < len(tbl[rr]):
+                nums = _extract_numbers_no_percent(_norm_text(tbl[rr][header_col]))
+                for n in nums:
+                    if min_v <= n <= max_v:
+                        vals.append(n)
+        if vals:
+            return vals[0] if pick == "first" else (max(vals) if pick == "max" else vals[-1])
+    return None
+
+
+def _section_has_phrase(raw_text: str, section_regex: str, phrase_regex: str, window: int = 1500) -> bool:
+    """Look for phrase within a limited window after a section header."""
+    if not raw_text:
+        return False
+    srx = re.compile(section_regex, re.IGNORECASE | re.DOTALL)
+    prx = re.compile(phrase_regex, re.IGNORECASE | re.DOTALL)
+    for m in srx.finditer(raw_text):
+        start = m.end()
+        end = min(len(raw_text), start + window)
+        if prx.search(raw_text[start:end]):
+            return True
+    return False
+
+
+
 # -------- Fill remaining BTA detail rows (table-first, then text) --------
 def fill_bta_detail_fields(features: dict, parsed: Dict[str, Any]) -> dict:
     raw_text = parsed.get("raw_text") or ""
@@ -1182,16 +1250,36 @@ def com_programs(parsed: Dict[str, Any]) -> List[ProgramModel]:
     program_code_text = _norm_text(program_code_text)
 
     # ---- base_sum_eur ----
-    base_sum = _amount_from_tables_by_column_header(
-        parsed, r"Apdrošinājuma\s+summa\s+vienai\s+personai,\s*EUR",
-        pick="max", min_v=1, max_v=10_000_000
-    ) or _amount_near_kw(raw_text, "Apdrošinājuma summa vienai personai, EUR", max_v=10_000_000) or 0.0
+    base_sum = (
+        _amount_from_tables_by_header_in_titled_table(
+            parsed,
+            r"PAMATPROGRAMMA\s+UN\s+PAPILDU\s+SEGUMS",
+            r"Apdrošinājuma\s+summa\s+vienai\s+personai,\s*EUR",
+            pick="first", min_v=1, max_v=10_000_000
+        )
+        or _amount_from_tables_by_column_header(
+            parsed, r"Apdrošinājuma\s+summa\s+vienai\s+personai,\s*EUR",
+            pick="first", min_v=1, max_v=10_000_000
+        )
+        or _amount_near_kw(raw_text, "Apdrošinājuma summa vienai personai, EUR", max_v=10_000_000)
+        or 0.0
+    )
 
     # ---- premium_eur ----
-    premium = _amount_from_tables_by_column_header(
-        parsed, r"Prēmija\s+vienai\s*[\r\n ]*personai,\s*EUR",
-        pick="max", min_v=1, max_v=100_000
-    ) or _amount_near_kw(raw_text, "Prēmija vienai personai, EUR", max_v=100_000) or 0.0
+    premium = (
+        _amount_from_tables_by_header_in_titled_table(
+            parsed,
+            r"PAMATPROGRAMMA\s+UN\s+PAPILDU\s+SEGUMS",
+            r"Prēmija\s+vienai\s*[\r\n ]*personai,\s*EUR",
+            pick="first", min_v=1, max_v=100_000
+        )
+        or _amount_from_tables_by_column_header(
+            parsed, r"Prēmija\s+vienai\s*[\r\n ]*personai,\s*EUR",
+            pick="first", min_v=1, max_v=100_000
+        )
+        or _amount_near_kw(raw_text, "Prēmija vienai personai, EUR", max_v=100_000)
+        or 0.0
+    )
 
     # ---- features ----
     feats = {
@@ -1247,7 +1335,13 @@ def com_programs(parsed: Dict[str, Any]) -> List[ProgramModel]:
         return t
 
     feats["Homeopāts"] = _mk_times_or_v(r"homeop[aā]t")
-    feats["Psihoterapeits"] = _mk_times_or_v(r"psihoterap|psihologa|psihiatra")
+        # Mark as 'v' only if the PAMATPROGRAMMA section explicitly mentions the consultation phrase
+    has_psy = _section_has_phrase(
+        raw_text,
+        r"\bPAMATPROGRAMMA\b",
+        r"Psihologa,\s*psihoterapeita\s+vai\s+psihiatra\s+konsultāc"
+    ) or bool(_find_value_in_tables_by_row(parsed, r"Psihologa,\s*psihoterapeita\s+vai\s+psihiatra\s+konsultāc"))
+    feats["Psihoterapeits"] = "v" if has_psy else "-"
     feats["Sporta ārsts"] = "v" if _text_has_kw(raw_text, "sporta ārsta konsultācija") or \
                               _find_value_in_tables_by_row(parsed, r"sporta\s+ārsta") else "-"
 
