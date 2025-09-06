@@ -31,7 +31,7 @@ def normalize_features(raw: dict, insurer: str, program_code: str, premium_eur: 
         norm["Apdrošinātājs"] = insurer
     if "Programmas kods" in norm:
         norm["Programmas kods"] = program_code  # keep exactly as displayed (incl. '+')
-    if "Pamatpolises prēmija 1 darbiniekam, EUR" in norm:
+    if "Pamatpolises prēmija 1 darbiniekam, EUR" in norm and premium_eur is not None:
         norm["Pamatpolises prēmija 1 darbiniekam, EUR"] = premium_eur
     if "Pamatpolises prēmija 1 darbiniekam" in norm:
         norm["Pamatpolises prēmija 1 darbiniekam"] = premium_eur
