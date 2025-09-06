@@ -737,11 +737,11 @@ def _amount_from_tables_by_column_header(parsed: Dict[str, Any], header_regex: s
                                          min_v: float = 0.0, max_v: float = 1_000_000) -> Optional[float]:
     """Locate a column by header text (stacked allowed) and return a plausible number below it."""
     tables = parsed.get("tables") or []
-    hdr = re.compile(header_regex, re.IGNORECASE)
+    hdr = re.compile(header_regex, re.IGNORECASE | re.DOTALL)
     for tbl in tables:
         if not tbl:
             continue
-        depth = min(5, len(tbl))
+        depth = min(8, len(tbl))
         max_cols = max((len(r) for r in tbl[:depth] if r), default=0)
 
         def stacked_header(col: int) -> str:
@@ -1261,7 +1261,16 @@ def com_programs(parsed: Dict[str, Any]) -> List[ProgramModel]:
             parsed, r"Apdrošinājuma\s+summa\s+vienai\s+personai,\s*EUR",
             pick="first", min_v=1, max_v=10_000_000
         )
-        or _amount_near_kw(raw_text, "Apdrošinājuma summa vienai personai, EUR", max_v=10_000_000)
+        or _amount_near_kw(  # NEW: matches the green sentence variant
+            raw_text,
+            "Pamatprogrammas apdrošinājuma summa vienai personai",
+            max_v=10_000_000
+        )
+        or _amount_near_kw(
+            raw_text,
+            "Apdrošinājuma summa vienai personai, EUR",
+            max_v=10_000_000
+        )
         or 0.0
     )
 
