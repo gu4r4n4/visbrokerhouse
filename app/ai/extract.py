@@ -675,6 +675,102 @@ def _num_from_tables_right_of_label(parsed: Dict[str, Any], label_regex: str) ->
                         if nums:
                             return nums[0]
     return None
+    
+# ======== COM generic helpers (paste right after _num_from_tables_right_of_label) ========
+
+def _text_has_kw(raw_text: str, kw: str) -> bool:
+    return bool(re.search(re.escape(kw), raw_text, re.IGNORECASE))
+
+def _amount_near_kw(raw_text: str, kw: str, window: int = 600,
+                    min_v: float = 0.0, max_v: float = 1_000_000) -> Optional[float]:
+    """Find first plausible number near a keyword in raw text."""
+    if not raw_text:
+        return None
+    for m in re.finditer(re.escape(kw), raw_text, flags=re.IGNORECASE):
+        start = max(0, m.start() - window // 2)
+        end = min(len(raw_text), m.end() + window)
+        chunk = raw_text[start:end]
+        nums = _extract_numbers_no_percent(chunk)
+        cand = [n for n in nums if min_v <= n <= max_v]
+        if cand:
+            return cand[0]
+    return None
+
+def _find_value_in_tables_by_row(parsed: Dict[str, Any], row_regex: str) -> Optional[str]:
+    """Return non-empty text found on the same row (prefer the rightmost non-empty cell)."""
+    tables = parsed.get("tables") or []
+    rgx = re.compile(row_regex, re.IGNORECASE | re.DOTALL)
+    for tbl in tables:
+        for row in (tbl or []):
+            cells = [_norm_text(c) for c in (row or [])]
+            if not any(cells):
+                continue
+            joined = " ".join(cells)
+            if rgx.search(joined):
+                vals = [c for c in cells if c and not rgx.search(c)]
+                if vals:
+                    return vals[-1]
+    return None
+
+def _amount_in_tables_by_row(parsed: Dict[str, Any], row_regex: str, max_pick: bool = True,
+                             min_v: float = 0.0, max_v: float = 1_000_000) -> Optional[float]:
+    """Find numeric value(s) on the same row; returns max or first."""
+    tables = parsed.get("tables") or []
+    rgx = re.compile(row_regex, re.IGNORECASE | re.DOTALL)
+    for tbl in tables:
+        for row in (tbl or []):
+            cells = [_norm_text(c) for c in (row or [])]
+            if not any(cells):
+                continue
+            joined = " ".join(cells)
+            if rgx.search(joined):
+                nums: List[float] = []
+                for c in cells:
+                    nums += _extract_numbers_no_percent(c)
+                nums = [n for n in nums if min_v <= n <= max_v]
+                if nums:
+                    return max(nums) if max_pick else nums[0]
+    return None
+
+def _amount_from_tables_by_column_header(parsed: Dict[str, Any], header_regex: str,
+                                         pick: str = "max", scan_rows: int = 30,
+                                         min_v: float = 0.0, max_v: float = 1_000_000) -> Optional[float]:
+    """Locate a column by header text (stacked allowed) and return a plausible number below it."""
+    tables = parsed.get("tables") or []
+    hdr = re.compile(header_regex, re.IGNORECASE)
+    for tbl in tables:
+        if not tbl:
+            continue
+        depth = min(5, len(tbl))
+        max_cols = max((len(r) for r in tbl[:depth] if r), default=0)
+
+        def stacked_header(col: int) -> str:
+            parts = []
+            for rr in range(depth):
+                if col < len(tbl[rr]):
+                    parts.append(_norm_text(tbl[rr][col]))
+            return " ".join(parts)
+
+        header_col = None
+        for c in range(max_cols):
+            if hdr.search(stacked_header(c)):
+                header_col = c
+                break
+        if header_col is None:
+            continue
+
+        vals: List[float] = []
+        for rr in range(depth, min(len(tbl), depth + scan_rows)):
+            if header_col < len(tbl[rr]):
+                nums = _extract_numbers_no_percent(_norm_text(tbl[rr][header_col]))
+                for n in nums:
+                    if min_v <= n <= max_v:
+                        vals.append(n)
+        if vals:
+            if pick == "max":   return max(vals)
+            if pick == "first": return vals[0]
+    return None
+
 
 # -------- Fill remaining BTA detail rows (table-first, then text) --------
 def fill_bta_detail_fields(features: dict, parsed: Dict[str, Any]) -> dict:
@@ -1064,6 +1160,196 @@ def _apply_bta_bottom_rules(features: dict, addons: Dict[str, Optional[float]]) 
         features["Vakcinācija pret ērčiem un gripu"] = vac
 
     return features
+    
+# ========================= COMPENSA (COM_VA) =========================
+
+def com_programs(parsed: Dict[str, Any]) -> List[ProgramModel]:
+    """
+    Extract Compensa values per mapping:
+      - program_code & Programmas nosaukums: row 'Pamatprogrammā iekļautie maksas pakalpojumi'
+      - base_sum_eur: column 'Apdrošinājuma summa vienai personai, EUR'
+      - premium_eur: column 'Prēmija vienai personai, EUR'
+      - many features via row/keyword lookups + COM hardcoded flags.
+    """
+    raw_text = parsed.get("raw_text") or ""
+
+    # ---- program_code / Programmas nosaukums ----
+    prog_label_re = r"Pamatprogramm[āa]\s+iekļautie\s+maksas\s+pakalpojumi"
+    program_code_text = _find_value_in_tables_by_row(parsed, prog_label_re)
+    if not program_code_text:
+        m = re.search(prog_label_re + r"[^\r\n]{0,80}?([A-Z0-9+/ ]{3,})", raw_text, re.IGNORECASE)
+        program_code_text = _norm_text(m.group(1)) if m else "Pamatprogramma"
+    program_code_text = _norm_text(program_code_text)
+
+    # ---- base_sum_eur ----
+    base_sum = _amount_from_tables_by_column_header(
+        parsed, r"Apdrošinājuma\s+summa\s+vienai\s+personai,\s*EUR",
+        pick="max", min_v=1, max_v=10_000_000
+    ) or _amount_near_kw(raw_text, "Apdrošinājuma summa vienai personai, EUR", max_v=10_000_000) or 0.0
+
+    # ---- premium_eur ----
+    premium = _amount_from_tables_by_column_header(
+        parsed, r"Prēmija\s+vienai\s*[\r\n ]*personai,\s*EUR",
+        pick="max", min_v=1, max_v=100_000
+    ) or _amount_near_kw(raw_text, "Prēmija vienai personai, EUR", max_v=100_000) or 0.0
+
+    # ---- features ----
+    feats = {
+        "Programmas nosaukums": program_code_text,
+        "Programmas kods": program_code_text,
+        "Apdrošinājuma summa pamatpolisei, EUR": base_sum or "-",
+        "Pamatpolises prēmija 1 darbiniekam, EUR": premium or "-",
+
+        # COM_VA hardcoded per your spec
+        "Pacientu iemaksa": "100%",
+        "ONLINE ārstu konsultācijas": "v",
+        "Laboratoriskie izmeklējumi": "v",
+        "Maksas diagnostika, piem., rentgens, elektrokradiogramma, USG, utml.": "v",
+        "Obligātās veselības pārbaudes, limits EUR": "100%",
+        "Ārstnieciskās manipulācijas": "v",
+        "Medicīniskās izziņas": "v",
+        "Procedūras": "v",
+    }
+
+    # Row / keyword lookups
+    feats["Maksas ģimenes ārsta mājas vizītes, limits EUR"] = (
+        _amount_in_tables_by_row(parsed, r"Ģimenes\s+ārstu,\s*internistu\s+un\s+pediatru\s+mājas\s+vizīte",
+                                 min_v=1, max_v=10_000) or
+        _amount_near_kw(raw_text, "mājas vizīte", max_v=10_000) or "-"
+    )
+
+    fam_cons_val = (
+        _amount_in_tables_by_row(parsed, r"Ģimenes\s+ārstu.*?(internistu).*?(pediatru).*?konsultāc", min_v=1, max_v=10_000) or
+        feats["Maksas ģimenes ārsta mājas vizītes, limits EUR"]
+    )
+    feats["Maksas ģimenes ārsta, internista, terapeita un pediatra konsultācija, limits EUR"] = fam_cons_val or "-"
+
+    feats["Maksas ārsta-specialista konsultācija, limits EUR"] = (
+        _amount_in_tables_by_row(parsed,
+            r"ārstu\s+speciālistu.*?konsultācijas|dermatologa|ginekologa|ķirurga|neirologa|traumatologa",
+            min_v=1, max_v=10_000) or "-"
+    )
+
+    feats["Profesora, docenta, internista konsultācija, limits EUR"] = (
+        _amount_in_tables_by_row(parsed, r"Medicīnas\s+profesoru\s+un\s+docentu\s+konsultāc", min_v=1, max_v=10_000) or
+        _amount_near_kw(raw_text, "profesoru un docentu konsultāc", max_v=10_000) or "-"
+    )
+
+    def _mk_times_or_v(kw: str) -> str:
+        t = "-"
+        if _text_has_kw(raw_text, kw) or _find_value_in_tables_by_row(parsed, kw):
+            m = re.search(r"(vienu|1|2|3|4|5)\s+reiz", raw_text, re.IGNORECASE)
+            if m:
+                token = m.group(1).lower()
+                t = "1x" if token in ("vienu", "1") else f"{token}x"
+            else:
+                t = "v"
+        return t
+
+    feats["Homeopāts"] = _mk_times_or_v(r"homeop[aā]t")
+    feats["Psihoterapeits"] = _mk_times_or_v(r"psihoterap|psihologa|psihiatra")
+    feats["Sporta ārsts"] = "v" if _text_has_kw(raw_text, "sporta ārsta konsultācija") or \
+                              _find_value_in_tables_by_row(parsed, r"sporta\s+ārsta") else "-"
+
+    feats["Augsto tehnoloģiju izmeklējumi, piem., MRG, CT, limits (reižu skaits vai EUR)"] = (
+        _amount_in_tables_by_row(parsed, r"Skaitļotājtomogrāfijas\s*\(CT\)\s*izmeklējumi", min_v=1, max_v=100_000) or "v"
+    )
+
+    # Fizikālā terapija – try to assemble "X reizes, Y%"
+    fiz_text = raw_text if _text_has_kw(raw_text, "Fizikālā terapija") else ""
+    times = re.search(r"(\d+)\s*reiz", fiz_text, re.IGNORECASE)
+    pct = re.search(r"(\d{1,3})\s*%", fiz_text)
+    if times and pct:
+        feats["Fizikālā terapija"] = f"{times.group(1)} reizes, {pct.group(1)}%"
+    else:
+        feats["Fizikālā terapija"] = _find_value_in_tables_by_row(parsed, r"Fizik[āa]l[āa]\s+terapij") or "-"
+
+    feats["Vakcinācija, limits EUR"] = (
+        _amount_in_tables_by_row(parsed, r"Vakc(in|ināc)", min_v=1, max_v=10_000) or
+        _amount_near_kw(raw_text, "Vakcinācija", max_v=10_000) or "-"
+    )
+
+    feats["Maksas grūtnieču aprūpe"] = "v" if (
+        _text_has_kw(raw_text, "Grūtnieču aprūpe") or _find_value_in_tables_by_row(parsed, r"Grūtnieču\s+aprūpe")
+    ) else "-"
+
+    feats["Maksas onkoloģiskā, hematoloģiskā ārstēšana"] = "v" if (
+        _text_has_kw(raw_text, "Onkologa ārstēšana") or _find_value_in_tables_by_row(parsed, r"Onkolog")
+    ) else "-"
+
+    feats["Neatliekamā palīdzība valsts un privātā (limits privātai, EUR)"] = (
+        _amount_in_tables_by_row(parsed, r"Neatliekam[āa]\s+medicīnisk[āa]\s+pal[īi]dz[īi]ba.*privāt", min_v=1, max_v=1_000_000) or
+        _amount_near_kw(raw_text, "privātā neatliekamā medicīniskā palīdzība", max_v=1_000_000) or "-"
+    )
+
+    feats["Maksas stacionārie pakalpojumi, limits EUR"] = (
+        _amount_in_tables_by_row(parsed, r"Maksas\s+stacionār(ie|ie)\s+pakalpojumi", min_v=1, max_v=1_000_000) or
+        _amount_near_kw(raw_text, "Maksas stacionārie pakalpojumi", max_v=1_000_000) or "-"
+    )
+
+    feats["Maksas stacionārā rehabilitācija, limits EUR"] = (
+        _amount_in_tables_by_row(parsed, r"stacionār[āa]\s+rehabilitāc", min_v=1, max_v=1_000_000) or
+        _amount_near_kw(raw_text, "Maksas stacionārā rehabilitācija", max_v=1_000_000) or "-"
+    )
+
+    feats["Ambulatorā rehabilitācija"] = (
+        _amount_in_tables_by_row(parsed, r"Ambulator[āa]\s+rehabilitāc", min_v=1, max_v=1_000_000) or
+        _amount_near_kw(raw_text, "Ambulatorā rehabilitācija", max_v=1_000_000) or "-"
+    )
+
+    feats["Piemaksa par plastikāta kartēm, EUR"] = (
+        _amount_in_tables_by_row(parsed, r"Piemaksa\s+par\s+plastikāta\s+kartēm", min_v=1, max_v=100) or
+        _amount_near_kw(raw_text, "Piemaksa par plastikāta kartēm", max_v=100) or "-"
+    )
+
+    feats["Zobārstniecība ar 50% atlaidi (pamatpolise)"] = (
+        _amount_in_tables_by_row(parsed, r"Zobārstniecība\s+ar\s+50%\s+atlaidi.*pamat", min_v=1, max_v=10_000) or "-"
+    )
+
+    feats["Zobārstniecība ar 50% atlaidi, apdrošinājuma summa (pp)"] = (
+        _amount_in_tables_by_row(parsed, r"Zobārstniecība\s+ar\s+50%\s+atlaidi", min_v=1, max_v=10_000) or "-"
+    )
+
+    feats["Vakcinācija pret ērčiem un gripu"] = (
+        _amount_in_tables_by_row(parsed, r"Profilaktisk[āa]\s+vakcin[āa]cija", min_v=1, max_v=10_000) or
+        feats.get("Vakcinācija, limits EUR", "-")
+    )
+
+    feats["Ambulatorā rehabilitācija (pp)"] = (
+        _amount_in_tables_by_row(parsed, r"Ambulator[āa]\s+rehabilitāc", min_v=1, max_v=1_000_000) or "-"
+    )
+
+    feats["Medikamenti ar 50% atlaidi"] = (
+        _amount_in_tables_by_row(parsed, r"Medikamenti\s+ar\s+50%\s+atlaidi", min_v=1, max_v=50_000) or "-"
+    )
+
+    feats["Sports"] = (
+        _amount_in_tables_by_row(parsed, r"\bSports\b", min_v=1, max_v=50_000) or
+        ("v" if _text_has_kw(raw_text, "Sports") else "-")
+    )
+
+    crit_amt = (
+        _amount_in_tables_by_row(parsed, r"Kritisk[āa]s\s+saslim", min_v=1, max_v=1_000_000) or
+        _amount_near_kw(raw_text, "Kritiskās saslimšanas", max_v=1_000_000)
+    )
+    feats["Kritiskās saslimšanas"] = (f"{int(crit_amt)}" if crit_amt else "ir iekļauts") if (
+        _text_has_kw(raw_text, "Kritiskās saslimšanas")
+    ) else "-"
+
+    feats["Maksas stacionārie pakalpojumi, limits EUR (pp)"] = (
+        "ir iekļauts" if _text_has_kw(raw_text, "Maksas stacionārie pakalpojumi") else "-"
+    )
+
+    prog = ProgramModel(
+        insurer="COM_VA",
+        program_code=program_code_text,
+        base_sum_eur=float(base_sum or 0.0),
+        premium_eur=float(premium or 0.0),
+        payment_method="-",
+        features=normalize_features(feats, "COM_VA", program_code_text, float(premium or 0.0)),
+    )
+    return [prog]
+
 
 # ----------------- BTA table scraping (header + row fallback) -----------------
 def _find_program_table_layout(tbl: List[List[str]]) -> Optional[Dict[str, int]]:
@@ -1584,6 +1870,14 @@ def _choose_bta_path(hint: str, parsed: Dict[str, Any]) -> str:
 async def ai_enrich_and_validate(parsed: Dict[str, Any], company_hint: str | None) -> List[ProgramModel]:
     hint_raw = (company_hint or "").strip()
     hint = hint_raw.lower()
+    
+# ----- COM / Compensa path (run before BTA) -----
+    mapped = _company_hint_to_code(company_hint or "")
+    if mapped == "COM_VA":
+        progs = com_programs(parsed)
+        if progs:
+            return progs
+# if COM-specific path failed, continue to the rest
 
     if "bta" in hint:
         path = _choose_bta_path(hint, parsed)
