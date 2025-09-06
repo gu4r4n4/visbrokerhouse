@@ -1289,16 +1289,17 @@ def com_programs(parsed: Dict[str, Any]) -> List[ProgramModel]:
     try:
         tables = parsed.get("tables") or []
     
-        title_ok  = re.compile(r"PAMATPROGRAMMA\s+UN\s+PAPILDU\s+SEGUMS", re.IGNORECASE)
+        # Tolerant title & header patterns
+        title_ok  = re.compile(r"PAMATPROGRAMMA[\s\S]{0,40}PAPILDU[\s\S]{0,20}SEGU", re.IGNORECASE)
         title_bad = re.compile(r"\bPAPILDPROGRAMMAS\b", re.IGNORECASE)
     
-        # be lenient about accents, comma/paren around EUR, and broken lines
+        # Accept line breaks, missing comma/EUR, and optional (52) etc.
         hdr_prem = re.compile(
-            r"pr[eē]mij[aā]\s+vienai\s*[\r\n ]*personai\s*,?\s*\(?\s*eur\)?",
+            r"pr[eē]mij[aā]\s+vienai[\s\r\n\u00A0]*personai(?:\s*[,;:]?\s*\(?\s*eur\)?)?(?:[\s\r\n]*\(?\s*52\s*\)?)?",
             re.IGNORECASE
         )
         hdr_sum  = re.compile(
-            r"apdro[sš]in[aā]juma\s+summa\s+vienai\s*[\r\n ]*personai\s*,?\s*eur",
+            r"apdro[sš]in[aā]juma\s+summa\s+vienai[\s\r\n\u00A0]*personai(?:\s*[,;:]?\s*\(?\s*eur\)?)?",
             re.IGNORECASE
         )
     
@@ -1307,9 +1308,9 @@ def com_programs(parsed: Dict[str, Any]) -> List[ProgramModel]:
             for rr in range(depth):
                 if c < len(tbl[rr]):
                     parts.append(_norm_text(tbl[rr][c]))
-            return " ".join(parts)
+            return " ".join(parts).strip()
     
-        def _first_number_under(tbl, col, start_row, scan_rows=40, min_v=50, max_v=10000):
+        def _first_number_under(tbl, col, start_row, scan_rows=240, min_v=30, max_v=10000):
             for rr in range(start_row, min(len(tbl), start_row + scan_rows)):
                 if col < len(tbl[rr]):
                     nums = _extract_numbers_no_percent(_norm_text(tbl[rr][col]))
@@ -1318,46 +1319,51 @@ def com_programs(parsed: Dict[str, Any]) -> List[ProgramModel]:
                             return n
             return None
     
-        # -------- (1) Titled table + inside/neighbor try
-        titled_indices = []
+        def _debug(msg):
+            if os.getenv("DEBUG_COM"):
+                print(msg)
+    
+        # (1) Titled tables → try inside first
+        titled_idxs = []
         for i, tbl in enumerate(tables):
             if not tbl:
                 continue
             title_blob = " ".join(
                 " ".join(_norm_text(c) for c in (tbl[r] or []))
-                for r in range(0, min(4, len(tbl)))
+                for r in range(0, min(5, len(tbl)))
             )
-            if not title_ok.search(title_blob) or title_bad.search(title_blob):
-                continue
-            titled_indices.append(i)
+            if title_ok.search(title_blob) and not title_bad.search(title_blob):
+                titled_idxs.append(i)
+                depth = min(10, len(tbl))
+                max_cols = max((len(r) for r in tbl[:depth] if r), default=0)
     
-            depth = min(8, len(tbl))
-            max_cols = max((len(r) for r in tbl[:depth] if r), default=0)
+                prem_col = None
+                for c in range(max_cols):
+                    h = _stacked_header(tbl, depth, c)
+                    if hdr_prem.search(h):
+                        prem_col = c
+                        _debug(f"[COM premium] titled tbl#{i} prem header @col{c}: {h!r}")
+                        break
+                if prem_col is not None:
+                    pval = _first_number_under(tbl, prem_col, depth)
+                    if pval is not None:
+                        premium = pval
+                        _debug(f"[COM premium] from titled tbl#{i} -> {premium}")
+                        break
     
-            prem_col = None
-            for c in range(max_cols):
-                if hdr_prem.search(_stacked_header(tbl, depth, c)):
-                    prem_col = c
-                    break
-    
-            # Try inside the same table first
-            if prem_col is not None:
-                pval = _first_number_under(tbl, prem_col, depth, scan_rows=120)
-                if pval is not None:
-                    premium = pval
-                    break
-    
-        # Right/left neighbor peek for each titled table (still useful if truly adjacent)
+        # (1a) Neighbor peek (right/left) around any titled table
         if premium is None:
-            for i in titled_indices:
+            for i in titled_idxs:
                 for neighbor in (i + 1, i - 1):
                     if 0 <= neighbor < len(tables) and tables[neighbor]:
                         tN = tables[neighbor]
-                        depthN = min(8, len(tN))
+                        depthN = min(10, len(tN))
                         max_colsN = max((len(r) for r in tN[:depthN] if r), default=0)
                         for c in range(max_colsN):
-                            if hdr_prem.search(_stacked_header(tN, depthN, c)):
-                                pval = _first_number_under(tN, c, depthN, scan_rows=200)
+                            h = _stacked_header(tN, depthN, c)
+                            if hdr_prem.search(h):
+                                pval = _first_number_under(tN, c, depthN)
+                                _debug(f"[COM premium] neighbor tbl#{neighbor} prem header @col{c}: {h!r} -> {pval}")
                                 if pval is not None:
                                     premium = pval
                                     break
@@ -1366,75 +1372,81 @@ def com_programs(parsed: Dict[str, Any]) -> List[ProgramModel]:
                 if premium is not None:
                     break
     
-        # -------- (1b) NEW: global premium-only scan (non-adjacent), while skipping PAPILDPROGRAMMAS
+        # (1b) Global scan for any premium column (skip PAPILDPROGRAMMAS)
         if premium is None:
-            for t in tables:
+            for ti, t in enumerate(tables):
                 if not t:
                     continue
-                head_blob = " ".join(
+                top = " ".join(
                     " ".join(_norm_text(c) for c in (t[r] or []))
                     for r in range(0, min(5, len(t)))
                 )
-                if title_bad.search(head_blob):
-                    # skip PAPILDPROGRAMMAS table (has its own premium like 114)
-                    continue
-    
-                depth = min(8, len(t))
+                if title_bad.search(top):
+                    continue  # skip the papildprogrammas grid
+                depth = min(10, len(t))
                 max_cols = max((len(r) for r in t[:depth] if r), default=0)
                 for c in range(max_cols):
                     h = _stacked_header(t, depth, c)
-                    if hdr_prem.search(h):
-                        pval = _first_number_under(t, c, depth, scan_rows=200)
+                    if hdr_prem.search(h) or ("prēmij" in h.lower() and ("person" in h.lower() or "eur" in h.lower())):
+                        pval = _first_number_under(t, c, depth)
+                        _debug(f"[COM premium] global tbl#{ti} prem header @col{c}: {h!r} -> {pval}")
                         if pval is not None:
                             premium = pval
                             break
                 if premium is not None:
                     break
     
-        # -------- (2) Header-pair fallback (when both headers are in the same table)
+        # (2) Header-pair fallback (both headers inside the same table)
         if premium is None:
-            for tbl in tables:
+            for ti, tbl in enumerate(tables):
                 if not tbl:
                     continue
-                top_blob = " ".join(
-                    " ".join(_norm_text(c) for c in (tbl[i] or []))
-                    for i in range(0, min(5, len(tbl)))
+                top = " ".join(
+                    " ".join(_norm_text(c) for c in (tbl[r] or []))
+                    for r in range(0, min(5, len(tbl)))
                 )
-                if title_bad.search(top_blob):
+                if title_bad.search(top):
                     continue
-                depth = min(8, len(tbl))
+                depth = min(10, len(tbl))
                 max_cols = max((len(r) for r in tbl[:depth] if r), default=0)
                 prem_col = sum_col = None
                 for c in range(max_cols):
-                    head = _stacked_header(tbl, depth, c)
-                    if prem_col is None and hdr_prem.search(head): prem_col = c
-                    if sum_col  is None and hdr_sum.search(head):  sum_col  = c
+                    h = _stacked_header(tbl, depth, c)
+                    if prem_col is None and (hdr_prem.search(h) or "prēmij" in h.lower()):
+                        prem_col = c
+                    if sum_col is None and (hdr_sum.search(h) or ("summa" in h.lower() and "person" in h.lower())):
+                        sum_col = c
                 if prem_col is None or sum_col is None:
                     continue
-                pval = _first_number_under(tbl, prem_col, depth, scan_rows=200)
+                pval = _first_number_under(tbl, prem_col, depth)
+                _debug(f"[COM premium] header-pair tbl#{ti} prem_col={prem_col}, sum_col={sum_col} -> {pval}")
                 if pval is not None:
                     premium = pval
                     break
     
-    except Exception:
-        pass
+    except Exception as e:
+        if os.getenv("DEBUG_COM"):
+            print("[COM premium] EXC:", repr(e))
     
-    # -------- (3) Last-resort fallbacks (unchanged)
+    # (3) Last resort
     if premium is None:
         premium = (
             _amount_from_tables_by_header_in_titled_table(
                 parsed,
-                r"PAMATPROGRAMMA\s+UN\s+PAPILDU\s+SEGUMS",
-                r"Prēmija\s+vienai\s*[\r\n ]*personai,\s*EUR",
-                pick="first", min_v=50, max_v=100_000
+                r"PAMATPROGRAMMA[\s\S]{0,60}PAPILDU[\s\S]{0,20}SEGU",
+                r"Prēmija\s+vienai\s*[\r\n ]*personai(?:\s*,?\s*\(?\s*EUR\)?)?",
+                pick="first", min_v=30, max_v=100_000
             )
             or _amount_from_tables_by_column_header(
-                parsed, r"Prēmija\s+vienai\s*[\r\n ]*personai,\s*EUR",
-                pick="first", min_v=50, max_v=100_000
+                parsed, r"Prēmija\s+vienai\s*[\r\n ]*personai(?:\s*,?\s*\(?\s*EUR\)?)?",
+                pick="first", min_v=30, max_v=100_000
             )
-            or _amount_near_kw(raw_text, "Prēmija vienai personai, EUR", min_v=50, max_v=100_000)
+            or _amount_near_kw(raw_text, "Prēmija vienai personai", min_v=30, max_v=100_000)
             or 0.0
         )
+    
+    if os.getenv("DEBUG_COM"):
+        print("[COM premium] FINAL =", premium)
 
 
     # ---- features ----
