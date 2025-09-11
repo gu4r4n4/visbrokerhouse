@@ -4,6 +4,8 @@ from typing import Dict, Any, List, Optional
 from pydantic import BaseModel, Field
 from .schema import json_schema, LV_FEATURE_KEYS
 from .prompts import SYSTEM, build_prompt
+from app.ai.gpt_extractor import extract_offer_from_pdf_bytes, call_gpt_extractor
+
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
@@ -2128,10 +2130,165 @@ def _choose_bta_path(hint: str, parsed: Dict[str, Any]) -> str:
         return "table"
     return "table"
 
-# ----------------- Non-BTA (AI) + BTA router -----------------
-async def ai_enrich_and_validate(parsed: Dict[str, Any], company_hint: str | None) -> List[ProgramModel]:
-    hint_raw = (company_hint or "").strip()
-    hint = hint_raw.lower()
+def ai_enrich_and_validate(parsed: Dict[str, Any], company_hint: str | None) -> List[ProgramModel]:
+    """
+    Main router:
+      1) Try the gpt_extractor fast-path (pdf_bytes/file_path/raw_text).
+      2) Compensa (COM_VA) dedicated parser.
+      3) BTA routers (table vs brochure) + premium rescue.
+      4) Generic LLM JSON fallback.
+      5) Naive fallback.
+    """
+    hint = (company_hint or "").strip().lower()
+
+    # ---------- 1) gpt_extractor fast-path ----------
+    try:
+        insurer_hint = ""  # let the extractor infer; we normalize later
+        filename = (parsed.get("filename") or parsed.get("name") or "uploaded.pdf")
+        payload = None
+
+        if parsed.get("pdf_bytes"):
+            payload = extract_offer_from_pdf_bytes(parsed["pdf_bytes"], document_id=filename, insurer_hint=insurer_hint)
+        elif parsed.get("file_path"):
+            with open(parsed["file_path"], "rb") as f:
+                payload = extract_offer_from_pdf_bytes(f.read(), document_id=filename, insurer_hint=insurer_hint)
+        elif parsed.get("raw_text"):
+            pages = [parsed["raw_text"][:20000]]
+            payload = call_gpt_extractor(document_id=filename, insurer_hint=insurer_hint, pdf_pages=pages)
+
+        if payload and payload.get("programs"):
+            programs: List[ProgramModel] = []
+            inferred_code = payload.get("insurer_code") or (_company_hint_to_code(company_hint or "") or (company_hint or "Nezināms"))
+            for pr in payload["programs"]:
+                raw_feats = pr.get("features", {}) or {}
+                feats = {k: (v.get("value") if isinstance(v, dict) else v) for k, v in raw_feats.items()}
+                premium_val = float(pr.get("premium_eur") or 0.0)
+
+                model = ProgramModel(
+                    insurer=inferred_code,
+                    program_code=pr["program_code"],
+                    base_sum_eur=float(pr.get("base_sum_eur") or 0.0),
+                    premium_eur=premium_val,
+                    features=normalize_features(feats, inferred_code, pr["program_code"], premium_val),
+                )
+                programs.append(model)
+
+            # BTA2 post-processing (singleton + premium mask)
+            if hint.startswith("bta2") and programs and len(programs) > 1:
+                programs = _force_single_for_bta2(programs, parsed)
+            if hint.startswith("bta2") and programs:
+                for p in programs:
+                    if "Pamatpolises prēmija 1 darbiniekam, EUR" in p.features:
+                        p.features["Pamatpolises prēmija 1 darbiniekam, EUR"] = "-"
+                    if "premium_eur" in p.features:
+                        p.features["premium_eur"] = "-"
+                    p.premium_eur = 0.0
+
+            return programs
+    except Exception:
+        # Keep going – we’ll take the legacy paths next
+        if os.getenv("DEBUG_AI"):
+            import traceback; print("gpt_extractor fast-path failed:\n", traceback.format_exc())
+
+    # ---------- 2) Compensa (COM_VA) dedicated path ----------
+    mapped = _company_hint_to_code(company_hint or "")
+    if mapped == "COM_VA":
+        progs = com_programs(parsed)
+        if progs:
+            return progs
+    # if COM-specific path failed, continue to the rest
+
+    # ---------- 3) BTA routing (table vs brochure) ----------
+    if "bta" in hint:
+        path = _choose_bta_path(hint, parsed)
+
+        if path == "table":
+            progs: List[ProgramModel] = bta_program_table(parsed)
+            if not progs:
+                # If table failed, try text if brochure signal is stronger
+                offer = _score_bta_offer_grid(parsed)
+                brochure = _score_bta_brochure(parsed)
+                if brochure >= offer:
+                    progs = bta_programs_from_text(parsed)
+            if not progs:
+                progs = bta_programs_from_text(parsed)
+        else:
+            progs = bta_programs_from_text(parsed)
+
+        # Rescue premiums from tables EVEN IF we came from text
+        if progs and any((p.premium_eur is None) or (p.premium_eur <= 0) for p in progs):
+            progs = _rescue_premiums_from_tables(parsed, progs)
+
+        # BTA2: force SINGLE program & premium mask
+        if hint.startswith("bta2") and progs and len(progs) > 1:
+            progs = _force_single_for_bta2(progs, parsed)
+        if hint.startswith("bta2") and progs:
+            for p in progs:
+                if "Pamatpolises prēmija 1 darbiniekam, EUR" in p.features:
+                    p.features["Pamatpolises prēmija 1 darbiniekam, EUR"] = "-"
+                if "premium_eur" in p.features:
+                    p.features["premium_eur"] = "-"
+                p.premium_eur = 0.0
+
+        if progs:
+            return progs
+        # If BTA routing produced nothing, fall through to generic AI or naive fallback below.
+
+    # ---------- 4) Generic LLM JSON fallback ----------
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return fallback_naive(parsed, company_hint)
+
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+
+        prompt = build_prompt(parsed, company_hint)
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role":"system","content":"Return ONLY strict JSON (no prose)."},
+                {"role":"system","content":SYSTEM},
+                {"role":"user","content":prompt},
+            ],
+            temperature=0,
+        )
+        content = resp.choices[0].message.content or "{}"
+        js = _extract_json_from_text(content) or "{}"
+        data = json.loads(js)
+        extracted = ExtractionModel.model_validate(data)
+        programs = extracted.programs
+
+        if company_hint:
+            # STRICT insurer normalization for non-BTA
+            normalized_insurer = _company_hint_to_code(company_hint) or company_hint
+            for p in programs:
+                p.insurer = normalized_insurer
+                p.features = normalize_features(
+                    p.features if isinstance(p.features, dict) else {},
+                    insurer=normalized_insurer,
+                    program_code=p.program_code,
+                    premium_eur=p.premium_eur,
+                )
+
+        # BTA2 singleton & premium mask on LLM path too
+        if hint.startswith("bta2") and programs and len(programs) > 1:
+            programs = _force_single_for_bta2(programs, parsed)
+        if hint.startswith("bta2") and programs:
+            for p in programs:
+                if "Pamatpolises prēmija 1 darbiniekam, EUR" in p.features:
+                    p.features["Pamatpolises prēmija 1 darbiniekam, EUR"] = "-"
+                if "premium_eur" in p.features:
+                    p.features["premium_eur"] = "-"
+                p.premium_eur = 0.0
+
+        return programs
+
+    except Exception:
+        # ---------- 5) Naive fallback ----------
+        return fallback_naive(parsed, company_hint)
+
+
     
 # ----- COM / Compensa path (run before BTA) -----
     mapped = _company_hint_to_code(company_hint or "")
