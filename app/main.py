@@ -2,6 +2,7 @@ import os
 import tempfile
 import traceback
 from typing import Any, Dict, List, Optional
+from app.ai.extract import ai_enrich_and_validate
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import JSONResponse, RedirectResponse
